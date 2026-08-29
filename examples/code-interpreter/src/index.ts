@@ -15,6 +15,7 @@ export { Sandbox } from '@cloudflare/sandbox';
 
 const API_PATH = '/run';
 const MODEL = '@cf/openai/gpt-oss-120b' as const;
+const MOUNT_PATH = '/mnt/r2';
 
 async function executePythonCode(
   env: Env,
@@ -27,49 +28,63 @@ async function executePythonCode(
     sandboxId.toString().slice(0, 63)
   );
 
-  await sandbox.mountBucket(
-    'IA_DATOS_BUCKET',
-    '/data',
-    {
-      readOnly: true
-    }
-  );
+  let bucketMounted = false;
 
-  const pythonCtx = await sandbox.createCodeContext({
-    language: 'python'
-  });
+  try {
+    await sandbox.mountBucket(
+      'IA_DATOS_BUCKET',
+      MOUNT_PATH,
+      {
+        readOnly: true
+      }
+    );
 
-  const result = await sandbox.runCode(code, {
-    context: pythonCtx
-  });
+    bucketMounted = true;
 
-  if (result.results?.length) {
-    const outputs = result.results
-      .map((r) => r.text || r.html || JSON.stringify(r))
-      .filter(Boolean);
+    const pythonCtx = await sandbox.createCodeContext({
+      language: 'python'
+    });
 
-    if (outputs.length) {
-      return outputs.join('\n');
-    }
-  }
+    const result = await sandbox.runCode(code, {
+      context: pythonCtx
+    });
 
-  let output = '';
+    if (result.results?.length) {
+      const outputs = result.results
+        .map((r) => r.text || r.html || JSON.stringify(r))
+        .filter(Boolean);
 
-  if (result.logs?.stdout?.length) {
-    output = result.logs.stdout.join('\n');
-  }
-
-  if (result.logs?.stderr?.length) {
-    if (output) {
-      output += '\n';
+      if (outputs.length) {
+        return outputs.join('\n');
+      }
     }
 
-    output += `Error: ${result.logs.stderr.join('\n')}`;
-  }
+    let output = '';
 
-  return result.error
-    ? `Error: ${result.error}`
-    : output || 'Code executed successfully';
+    if (result.logs?.stdout?.length) {
+      output = result.logs.stdout.join('\n');
+    }
+
+    if (result.logs?.stderr?.length) {
+      if (output) {
+        output += '\n';
+      }
+
+      output += `Error: ${result.logs.stderr.join('\n')}`;
+    }
+
+    return result.error
+      ? `Error: ${result.error}`
+      : output || 'Code executed successfully';
+  } finally {
+    if (bucketMounted) {
+      try {
+        await sandbox.unmountBucket(MOUNT_PATH);
+      } catch (error) {
+        console.error('R2 bucket unmount failed:', error);
+      }
+    }
+  }
 }
 
 async function handleAIRequest(
@@ -90,8 +105,7 @@ async function handleAIRequest(
     ],
     tools: {
       execute_python: tool({
-        description:
-          'Execute Python code and return the output',
+        description: 'Execute Python code and return the output',
         inputSchema: z.object({
           code: z.string().describe(
             'The Python code to execute'
