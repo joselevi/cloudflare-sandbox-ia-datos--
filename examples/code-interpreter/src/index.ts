@@ -1,18 +1,40 @@
-import { getSandbox } from '@cloudflare/sandbox';
-import { generateText, stepCountIs, tool } from 'ai';
+import {
+  ContainerProxy,
+  getSandbox
+} from '@cloudflare/sandbox';
+import {
+  generateText,
+  stepCountIs,
+  tool
+} from 'ai';
 import { createWorkersAI } from 'workers-ai-provider';
 import { z } from 'zod';
 
-export { Sandbox } from '@cloudflare/sandbox';
+export {
+  ContainerProxy,
+  Sandbox
+} from '@cloudflare/sandbox';
 
 const API_PATH = '/run';
 const MODEL = '@cf/openai/gpt-oss-120b' as const;
 
-async function executePythonCode(env: Env, code: string): Promise<string> {
+async function executePythonCode(
+  env: Env,
+  code: string
+): Promise<string> {
   const sandboxId = env.Sandbox.idFromName('default');
+
   const sandbox = getSandbox(
     env.Sandbox,
     sandboxId.toString().slice(0, 63)
+  );
+
+  await sandbox.mountBucket(
+    'IA_DATOS_BUCKET',
+    '/data',
+    {
+      readOnly: true
+    }
   );
 
   const pythonCtx = await sandbox.createCodeContext({
@@ -70,9 +92,12 @@ async function handleAIRequest(
     ],
     tools: {
       execute_python: tool({
-        description: 'Execute Python code and return the output',
+        description:
+          'Execute Python code and return the output',
         inputSchema: z.object({
-          code: z.string().describe('The Python code to execute')
+          code: z.string().describe(
+            'The Python code to execute'
+          )
         }),
         execute: async ({ code }) => {
           return executePythonCode(env, code);
@@ -98,7 +123,8 @@ export default {
       }
     ).CLOUDFLARE_IA_DATOS_WORKER_TOKEN;
 
-    const authorization = request.headers.get('Authorization');
+    const authorization =
+      request.headers.get('Authorization');
 
     const expectedAuthorization = workerToken
       ? `Bearer ${workerToken}`
@@ -145,7 +171,10 @@ export default {
         );
       }
 
-      const output = await handleAIRequest(input, env);
+      const output = await handleAIRequest(
+        input,
+        env
+      );
 
       return Response.json({
         output
