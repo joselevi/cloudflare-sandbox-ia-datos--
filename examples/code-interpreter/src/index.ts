@@ -10,27 +10,40 @@ const MODEL = '@cf/meta/llama-3.1-8b-instruct-fp8' as const;
 
 async function executePythonCode(env: Env, code: string): Promise<string> {
   const sandboxId = env.Sandbox.idFromName('default');
-  const sandbox = getSandbox(env.Sandbox, sandboxId.toString().slice(0, 63));
-  const pythonCtx = await sandbox.createCodeContext({ language: 'python' });
+  const sandbox = getSandbox(
+    env.Sandbox,
+    sandboxId.toString().slice(0, 63)
+  );
+
+  const pythonCtx = await sandbox.createCodeContext({
+    language: 'python'
+  });
+
   const result = await sandbox.runCode(code, {
     context: pythonCtx
   });
 
-  // Extract output from results (expressions)
   if (result.results?.length) {
     const outputs = result.results
       .map((r) => r.text || r.html || JSON.stringify(r))
       .filter(Boolean);
-    if (outputs.length) return outputs.join('\n');
+
+    if (outputs.length) {
+      return outputs.join('\n');
+    }
   }
 
-  // Extract output from logs
   let output = '';
+
   if (result.logs?.stdout?.length) {
     output = result.logs.stdout.join('\n');
   }
+
   if (result.logs?.stderr?.length) {
-    if (output) output += '\n';
+    if (output) {
+      output += '\n';
+    }
+
     output += `Error: ${result.logs.stderr.join('\n')}`;
   }
 
@@ -39,12 +52,22 @@ async function executePythonCode(env: Env, code: string): Promise<string> {
     : output || 'Code executed successfully';
 }
 
-async function handleAIRequest(input: string, env: Env): Promise<string> {
-  const workersai = createWorkersAI({ binding: env.AI });
+async function handleAIRequest(
+  input: string,
+  env: Env
+): Promise<string> {
+  const workersai = createWorkersAI({
+    binding: env.AI
+  });
 
   const result = await generateText({
     model: workersai(MODEL),
-    messages: [{ role: 'user', content: input }],
+    messages: [
+      {
+        role: 'user',
+        content: input
+      }
+    ],
     tools: {
       execute_python: tool({
         description: 'Execute Python code and return the output',
@@ -63,27 +86,86 @@ async function handleAIRequest(input: string, env: Env): Promise<string> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env
+  ): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname !== API_PATH || request.method !== 'POST') {
-      return new Response('Not Found', { status: 404 });
+    const workerToken = (
+      env as Env & {
+        CLOUDFLARE_IA_DATOS_WORKER_TOKEN?: string;
+      }
+    ).CLOUDFLARE_IA_DATOS_WORKER_TOKEN;
+
+    const authorization = request.headers.get('Authorization');
+
+    const expectedAuthorization = workerToken
+      ? `Bearer ${workerToken}`
+      : null;
+
+    if (
+      !expectedAuthorization ||
+      authorization !== expectedAuthorization
+    ) {
+      return Response.json(
+        {
+          error: 'Unauthorized'
+        },
+        {
+          status: 401
+        }
+      );
+    }
+
+    if (
+      url.pathname !== API_PATH ||
+      request.method !== 'POST'
+    ) {
+      return new Response('Not Found', {
+        status: 404
+      });
     }
 
     try {
-      const { input } = await request.json<{ input?: string }>();
+      const body = await request.json<{
+        input?: string;
+      }>();
+
+      const { input } = body;
 
       if (!input) {
-        return Response.json({ error: 'Missing input field' }, { status: 400 });
+        return Response.json(
+          {
+            error: 'Missing input field'
+          },
+          {
+            status: 400
+          }
+        );
       }
 
       const output = await handleAIRequest(input, env);
-      return Response.json({ output });
+
+      return Response.json({
+        output
+      });
     } catch (error) {
       console.error('Request failed:', error);
+
       const message =
-        error instanceof Error ? error.message : 'Internal Server Error';
-      return Response.json({ error: message }, { status: 500 });
+        error instanceof Error
+          ? error.message
+          : 'Internal Server Error';
+
+      return Response.json(
+        {
+          error: message
+        },
+        {
+          status: 500
+        }
+      );
     }
   }
 } satisfies ExportedHandler<Env>;
