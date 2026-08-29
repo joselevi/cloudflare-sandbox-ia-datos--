@@ -10,10 +10,8 @@ import {
 import { createWorkersAI } from 'workers-ai-provider';
 import { z } from 'zod';
 
-export {
-  ContainerProxy,
-  Sandbox
-} from '@cloudflare/sandbox';
+export { ContainerProxy };
+export { Sandbox } from '@cloudflare/sandbox';
 
 const API_PATH = '/run';
 const MODEL = '@cf/openai/gpt-oss-120b' as const;
