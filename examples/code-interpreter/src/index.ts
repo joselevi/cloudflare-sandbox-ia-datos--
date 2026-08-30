@@ -83,6 +83,26 @@ async function executePythonCode(
       stderr: result.logs?.stderr?.length || 0
     });
 
+    if (
+      result.error ||
+      result.logs?.stderr?.length
+    ) {
+      const pythonError = [
+        result.error
+          ? String(result.error)
+          : '',
+        result.logs?.stderr?.length
+          ? result.logs.stderr.join('\n')
+          : ''
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      throw new Error(
+        pythonError || 'Python execution failed'
+      );
+    }
+
     if (result.results?.length) {
       const outputs = result.results
         .map((item) => {
@@ -97,27 +117,11 @@ async function executePythonCode(
       }
     }
 
-    let output = '';
-
     if (result.logs?.stdout?.length) {
-      output = result.logs.stdout.join('\n');
+      return result.logs.stdout.join('\n');
     }
 
-    if (result.logs?.stderr?.length) {
-      if (output) {
-        output += '\n';
-      }
-
-      output += `Error: ${
-        result.logs.stderr.join('\n')
-      }`;
-    }
-
-    if (result.error) {
-      return `Error: ${result.error}`;
-    }
-
-    return output || 'Code executed successfully';
+    return 'Code executed successfully';
   } catch (error) {
     console.error('[Worker] executePythonCode ERROR', {
       message: error instanceof Error
@@ -162,9 +166,13 @@ async function handleAIRequest(
   const runtimeContext = csvPath
     ? [
         `CSV disponible en ${csvPath}.`,
-        'Ejecutá execute_python inmediatamente.',
-        'Procesá el CSV completo.',
-        'Después devolvé únicamente JSON válido.'
+        'Ejecutá execute_python una sola vez.',
+        'Leé el CSV completo usando pandas.',
+        'El CSV utiliza separador punto y coma (;).',
+        'Usá dtype=str para conservar los valores.',
+        'No hagas prints intermedios.',
+        'El código Python debe imprimir únicamente el JSON final.',
+        'Después devolvé únicamente ese JSON válido.'
       ].join('\n')
     : [
         'Procesá la instrucción recibida.',
@@ -189,31 +197,40 @@ async function handleAIRequest(
       ],
       tools: {
         execute_python: tool({
-          description:
-            'Ejecuta Python dentro del Sandbox para procesar el CSV completo.',
+          description: [
+            'Ejecuta Python dentro del Sandbox.',
+            'Debe leer el CSV completo.',
+            'Debe usar el separador ;.',
+            'Debe devolver únicamente el JSON final.'
+          ].join(' '),
           inputSchema: z.object({
             code: z.string().describe(
               'Código Python completo para ejecutar el análisis'
             )
           }),
           execute: async ({ code }) => {
-            console.log('[Worker] execute_python TOOL START');
+            console.log(
+              '[Worker] execute_python TOOL START'
+            );
 
             const output = await executePythonCode(
               env,
               code
             );
 
-            console.log('[Worker] execute_python TOOL END', {
-              outputLength: output.length
-            });
+            console.log(
+              '[Worker] execute_python TOOL END',
+              {
+                outputLength: output.length
+              }
+            );
 
             return output;
           }
         })
       },
-      maxOutputTokens: 16384,
-      stopWhen: stepCountIs(8)
+      maxOutputTokens: 8192,
+      stopWhen: stepCountIs(2)
     });
 
     const toolCalls = (result.steps || [])
