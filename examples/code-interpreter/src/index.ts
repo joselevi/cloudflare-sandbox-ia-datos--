@@ -45,10 +45,10 @@ async function executePythonCode(
 
   let bucketMounted = false;
 
-  console.log('[Worker] executePythonCode START');
+  // console.log('[Worker] executePythonCode START');
 
   try {
-    console.log('[Worker] mountBucket START');
+    // console.log('[Worker] mountBucket START');
 
     await sandbox.mountBucket(
       'IA_DATOS_BUCKET',
@@ -60,28 +60,30 @@ async function executePythonCode(
 
     bucketMounted = true;
 
-    console.log('[Worker] mountBucket END');
+    // console.log('[Worker] mountBucket END');
 
-    console.log('[Worker] createCodeContext START');
+    // console.log('[Worker] createCodeContext START');
 
     const pythonCtx = await sandbox.createCodeContext({
       language: 'python'
     });
 
-    console.log('[Worker] createCodeContext END');
+    // console.log('[Worker] createCodeContext END');
 
-    console.log('[Worker] runCode START');
+    // console.log('[Worker] runCode START');
 
     const result = await sandbox.runCode(code, {
       context: pythonCtx
     });
 
+    /*
     console.log('[Worker] runCode END', {
       hasError: Boolean(result.error),
       results: result.results?.length || 0,
       stdout: result.logs?.stdout?.length || 0,
       stderr: result.logs?.stderr?.length || 0
     });
+    */
 
     if (
       result.error ||
@@ -123,22 +125,25 @@ async function executePythonCode(
 
     return 'Code executed successfully';
   } catch (error) {
+    /*
     console.error('[Worker] executePythonCode ERROR', {
       message: error instanceof Error
         ? error.message
         : 'Unknown error'
     });
+    */
 
     throw error;
   } finally {
     if (bucketMounted) {
-      console.log('[Worker] unmountBucket START');
+      // console.log('[Worker] unmountBucket START');
 
       try {
         await sandbox.unmountBucket(MOUNT_PATH);
 
-        console.log('[Worker] unmountBucket END');
+        // console.log('[Worker] unmountBucket END');
       } catch (error) {
+        /*
         console.error(
           '[Worker] unmountBucket ERROR',
           {
@@ -147,10 +152,11 @@ async function executePythonCode(
               : 'Unknown error'
           }
         );
+        */
       }
     }
 
-    console.log('[Worker] executePythonCode END');
+    // console.log('[Worker] executePythonCode END');
   }
 }
 
@@ -180,10 +186,12 @@ async function handleAIRequest(
         'Después devolvé la respuesta final.'
       ].join('\n');
 
+  /*
   console.log('[Worker] generateText START', {
     hasCsvPath: Boolean(csvPath),
     promptLength: prompt.length
   });
+  */
 
   try {
     const result = await generateText({
@@ -209,21 +217,25 @@ async function handleAIRequest(
             )
           }),
           execute: async ({ code }) => {
+            /*
             console.log(
               '[Worker] execute_python TOOL START'
             );
+            */
 
             const output = await executePythonCode(
               env,
               code
             );
 
+            /*
             console.log(
               '[Worker] execute_python TOOL END',
               {
                 outputLength: output.length
               }
             );
+            */
 
             return output;
           }
@@ -245,6 +257,7 @@ async function handleAIRequest(
 
     const finalText = result.text?.trim() || '';
 
+    /*
     console.log('[Worker] generateText END', {
       finishReason: result.finishReason || 'unknown',
       steps: result.steps?.length || 0,
@@ -252,6 +265,7 @@ async function handleAIRequest(
       toolResults,
       responseLength: finalText.length
     });
+    */
 
     if (!finalText) {
       throw new Error(
@@ -277,11 +291,13 @@ async function handleAIRequest(
 
     return finalText;
   } catch (error) {
+    /*
     console.error('[Worker] generateText ERROR', {
       message: error instanceof Error
         ? error.message
         : 'Unknown error'
     });
+    */
 
     throw error;
   }
@@ -294,10 +310,12 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
+    /*
     console.log('[Worker] REQUEST START', {
       method: request.method,
       pathname: url.pathname
     });
+    */
 
     const workerToken = (
       env as Env & {
@@ -316,7 +334,7 @@ export default {
       !expectedAuthorization ||
       authorization !== expectedAuthorization
     ) {
-      console.error('[Worker] AUTH ERROR');
+      // console.error('[Worker] AUTH ERROR');
 
       return Response.json(
         {
@@ -332,10 +350,12 @@ export default {
       url.pathname !== API_PATH ||
       request.method !== 'POST'
     ) {
+      /*
       console.error('[Worker] ROUTE ERROR', {
         method: request.method,
         pathname: url.pathname
       });
+      */
 
       return new Response('Not Found', {
         status: 404
@@ -362,11 +382,13 @@ export default {
         prompt
       } = body;
 
+      /*
       console.log('[Worker] BODY RECEIVED', {
         hasInput: Boolean(input),
         hasObjectKey: Boolean(objectKey),
         hasPrompt: Boolean(prompt)
       });
+      */
 
       if (
         objectKey !== undefined &&
@@ -416,10 +438,12 @@ export default {
         ? `${MOUNT_PATH}/${objectKey}`
         : undefined;
 
+      /*
       console.log('[Worker] REQUEST VALIDATED', {
         hasCsvPath: Boolean(csvPath),
         promptLength: requestPrompt.length
       });
+      */
 
       const output = await handleAIRequest(
         requestPrompt,
@@ -427,19 +451,23 @@ export default {
         env
       );
 
+      /*
       console.log('[Worker] REQUEST END', {
         outputLength: output.length
       });
+      */
 
       return Response.json({
         output
       });
     } catch (error) {
+      /*
       console.error('[Worker] REQUEST ERROR', {
         message: error instanceof Error
           ? error.message
           : 'Internal Server Error'
       });
+      */
 
       const message =
         error instanceof Error
