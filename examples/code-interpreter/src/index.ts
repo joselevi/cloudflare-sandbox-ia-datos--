@@ -124,17 +124,15 @@ async function handleAIRequest(
 
   const runtimeContext = csvPath
     ? [
-        'Contexto técnico de esta ejecución:',
-        `El CSV está disponible únicamente en: ${csvPath}`,
-        'El archivo debe leerse utilizando execute_python.',
-        'Procesá el 100% del CSV.',
-        'No inventes resultados.',
-        'Después de ejecutar Python, devolvé únicamente JSON válido.'
+        `CSV disponible en ${csvPath}.`,
+        'Ejecutá execute_python inmediatamente.',
+        'Procesá el CSV completo.',
+        'Después devolvé únicamente JSON válido.'
       ].join('\n')
     : [
-        'Ejecutá la instrucción recibida.',
-        'Si requiere datos, utilizá execute_python.',
-        'Después de ejecutar la herramienta, devolvé la respuesta final.'
+        'Procesá la instrucción recibida.',
+        'Usá execute_python si corresponde.',
+        'Después devolvé la respuesta final.'
       ].join('\n');
 
   const result = await generateText({
@@ -148,12 +146,8 @@ async function handleAIRequest(
     ],
     tools: {
       execute_python: tool({
-        description: [
-          'Ejecuta Python dentro del Sandbox.',
-          'Para auditorías CSV, debe leer el archivo',
-          'desde la ruta indicada en el contexto técnico.',
-          'Debe procesar todos los registros.'
-        ].join(' '),
+        description:
+          'Ejecuta Python dentro del Sandbox para procesar el CSV completo.',
         inputSchema: z.object({
           code: z.string().describe(
             'Código Python completo para ejecutar el análisis'
@@ -164,6 +158,7 @@ async function handleAIRequest(
         }
       })
     },
+    maxOutputTokens: 16384,
     stopWhen: stepCountIs(8)
   });
 
