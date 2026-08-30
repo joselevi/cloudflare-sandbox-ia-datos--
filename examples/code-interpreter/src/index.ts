@@ -23,7 +23,9 @@ type WorkerRequest = {
   prompt?: string;
 };
 
-const isValidObjectKey = (objectKey: unknown): objectKey is string => {
+const isValidObjectKey = (
+  objectKey: unknown
+): objectKey is string => {
   return (
     typeof objectKey === 'string' &&
     /^analisis\/[0-9a-f-]{36}\.csv$/i.test(objectKey)
@@ -64,7 +66,11 @@ async function executePythonCode(
 
     if (result.results?.length) {
       const outputs = result.results
-        .map((r) => r.text || r.html || JSON.stringify(r))
+        .map((item) => {
+          return item.text ||
+            item.html ||
+            JSON.stringify(item);
+        })
         .filter(Boolean);
 
       if (outputs.length) {
@@ -83,45 +89,74 @@ async function executePythonCode(
         output += '\n';
       }
 
-      output += `Error: ${result.logs.stderr.join('\n')}`;
+      output += `Error: ${
+        result.logs.stderr.join('\n')
+      }`;
     }
 
-    return result.error
-      ? `Error: ${result.error}`
-      : output || 'Code executed successfully';
+    if (result.error) {
+      return `Error: ${result.error}`;
+    }
+
+    return output || 'Code executed successfully';
   } finally {
     if (bucketMounted) {
       try {
         await sandbox.unmountBucket(MOUNT_PATH);
       } catch (error) {
-        console.error('R2 bucket unmount failed:', error);
+        console.error(
+          'R2 bucket unmount failed:',
+          error
+        );
       }
     }
   }
 }
 
 async function handleAIRequest(
-  input: string,
+  prompt: string,
+  csvPath: string | undefined,
   env: Env
 ): Promise<string> {
   const workersai = createWorkersAI({
     binding: env.AI
   });
 
+  const runtimeContext = csvPath
+    ? [
+        'Contexto técnico de esta ejecución:',
+        `El CSV está disponible únicamente en: ${csvPath}`,
+        'El archivo debe leerse utilizando execute_python.',
+        'Procesá el 100% del CSV.',
+        'No inventes resultados.',
+        'Después de ejecutar Python, devolvé únicamente JSON válido.'
+      ].join('\n')
+    : [
+        'Ejecutá la instrucción recibida.',
+        'Si requiere datos, utilizá execute_python.',
+        'Después de ejecutar la herramienta, devolvé la respuesta final.'
+      ].join('\n');
+
   const result = await generateText({
     model: workersai(MODEL),
+    system: runtimeContext,
     messages: [
       {
         role: 'user',
-        content: input
+        content: prompt
       }
     ],
     tools: {
       execute_python: tool({
-        description: 'Execute Python code and return the output',
+        description: [
+          'Ejecuta Python dentro del Sandbox.',
+          'Para auditorías CSV, debe leer el archivo',
+          'desde la ruta indicada en el contexto técnico.',
+          'Debe procesar todos los registros.'
+        ].join(' '),
         inputSchema: z.object({
           code: z.string().describe(
-            'The Python code to execute'
+            'Código Python completo para ejecutar el análisis'
           )
         }),
         execute: async ({ code }) => {
@@ -129,10 +164,44 @@ async function handleAIRequest(
         }
       })
     },
-    stopWhen: stepCountIs(5)
+    stopWhen: stepCountIs(8)
   });
 
-  return result.text || 'No response generated';
+  const finalText = result.text?.trim() || '';
+
+  const toolCalls = (result.steps || [])
+    .reduce((total, step) => {
+      return total + (step.toolCalls?.length || 0);
+    }, 0);
+
+  const toolResults = (result.steps || [])
+    .reduce((total, step) => {
+      return total + (step.toolResults?.length || 0);
+    }, 0);
+
+  if (!finalText) {
+    throw new Error(
+      [
+        'Workers AI no generó respuesta final.',
+        `finishReason=${result.finishReason || 'unknown'}`,
+        `steps=${result.steps?.length || 0}`,
+        `toolCalls=${toolCalls}`,
+        `toolResults=${toolResults}`
+      ].join(' ')
+    );
+  }
+
+  if (csvPath) {
+    try {
+      JSON.parse(finalText);
+    } catch {
+      throw new Error(
+        'Workers AI devolvió una respuesta que no es JSON válido.'
+      );
+    }
+  }
+
+  return finalText;
 }
 
 export default {
@@ -181,6 +250,17 @@ export default {
     try {
       const body = await request.json<WorkerRequest>();
 
+      if (!body || typeof body !== 'object') {
+        return Response.json(
+          {
+            error: 'Invalid request body'
+          },
+          {
+            status: 400
+          }
+        );
+      }
+
       const {
         input,
         objectKey,
@@ -201,17 +281,26 @@ export default {
         );
       }
 
-      let requestInput = input;
+      const usingObjectKey =
+        typeof objectKey === 'string';
 
-      if (!requestInput && objectKey) {
-        requestInput = [
-          prompt || '',
-          `El archivo está disponible en ${MOUNT_PATH}/${objectKey}.`,
-          'Utiliza execute_python para ejecutar una prueba sobre ese archivo.'
-        ].join('\n\n');
+      if (usingObjectKey && !prompt) {
+        return Response.json(
+          {
+            error: 'Missing prompt field'
+          },
+          {
+            status: 400
+          }
+        );
       }
 
-      if (!requestInput) {
+      const requestPrompt =
+        usingObjectKey
+          ? prompt
+          : input;
+
+      if (!requestPrompt) {
         return Response.json(
           {
             error: 'Missing input or objectKey field'
@@ -222,8 +311,13 @@ export default {
         );
       }
 
+      const csvPath = usingObjectKey
+        ? `${MOUNT_PATH}/${objectKey}`
+        : undefined;
+
       const output = await handleAIRequest(
-        requestInput,
+        requestPrompt,
+        csvPath,
         env
       );
 
