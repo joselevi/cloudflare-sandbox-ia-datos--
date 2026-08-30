@@ -17,6 +17,19 @@ const API_PATH = '/run';
 const MODEL = '@cf/openai/gpt-oss-120b' as const;
 const MOUNT_PATH = '/mnt/r2';
 
+type WorkerRequest = {
+  input?: string;
+  objectKey?: string;
+  prompt?: string;
+};
+
+const isValidObjectKey = (objectKey: unknown): objectKey is string => {
+  return (
+    typeof objectKey === 'string' &&
+    /^analisis\/[0-9a-f-]{36}\.csv$/i.test(objectKey)
+  );
+};
+
 async function executePythonCode(
   env: Env,
   code: string
@@ -166,16 +179,42 @@ export default {
     }
 
     try {
-      const body = await request.json<{
-        input?: string;
-      }>();
+      const body = await request.json<WorkerRequest>();
 
-      const { input } = body;
+      const {
+        input,
+        objectKey,
+        prompt
+      } = body;
 
-      if (!input) {
+      if (
+        objectKey !== undefined &&
+        !isValidObjectKey(objectKey)
+      ) {
         return Response.json(
           {
-            error: 'Missing input field'
+            error: 'Invalid objectKey'
+          },
+          {
+            status: 400
+          }
+        );
+      }
+
+      let requestInput = input;
+
+      if (!requestInput && objectKey) {
+        requestInput = [
+          prompt || '',
+          `El archivo está disponible en ${MOUNT_PATH}/${objectKey}.`,
+          'Utiliza execute_python para ejecutar una prueba sobre ese archivo.'
+        ].join('\n\n');
+      }
+
+      if (!requestInput) {
+        return Response.json(
+          {
+            error: 'Missing input or objectKey field'
           },
           {
             status: 400
@@ -184,7 +223,7 @@ export default {
       }
 
       const output = await handleAIRequest(
-        input,
+        requestInput,
         env
       );
 
