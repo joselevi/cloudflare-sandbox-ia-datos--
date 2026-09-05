@@ -9,19 +9,25 @@ export { Sandbox } from '@cloudflare/sandbox';
 const API_PATH = '/run';
 const MODEL = '@cf/openai/gpt-oss-120b' as const;
 
+type SetStage = (stage: string) => void;
+
 async function executePythonCode(
   env: Env,
   code: string,
-  objectKey: string
+  objectKey: string,
+  setStage: SetStage
 ): Promise<string> {
-  const sandboxId = env.Sandbox.idFromName('default');
+  setStage('sandbox_get');
 
+  const sandboxId = env.Sandbox.idFromName('default');
   const sandbox = getSandbox(
     env.Sandbox,
     sandboxId.toString().slice(0, 63)
   );
 
   const csvPath = `/mnt/r2/${objectKey}`;
+
+  setStage('sandbox_mount_r2');
 
   await sandbox.mountBucket(
     'IA_DATOS_BUCKET',
@@ -31,13 +37,19 @@ async function executePythonCode(
     }
   );
 
+  setStage('sandbox_create_python_context');
+
   const pythonCtx = await sandbox.createCodeContext({
     language: 'python'
   });
 
+  setStage('sandbox_run_python');
+
   const result = await sandbox.runCode(code, {
     context: pythonCtx
   });
+
+  setStage('sandbox_python_completed');
 
   if (result.results?.length) {
     const outputs = result.results
@@ -71,13 +83,18 @@ async function executePythonCode(
 async function handleAIRequest(
   prompt: string,
   objectKey: string,
-  env: Env
+  env: Env,
+  setStage: SetStage
 ): Promise<string> {
+  setStage('workers_ai_initialize');
+
   const workersai = createWorkersAI({
     binding: env.AI
   });
 
   const csvPath = `/mnt/r2/${objectKey}`;
+
+  setStage('workers_ai_generate_text');
 
   const result = await generateText({
     model: workersai(MODEL),
@@ -107,13 +124,20 @@ async function handleAIRequest(
           )
         }),
         execute: async ({ code }) => {
-          return executePythonCode(env, code, objectKey);
+          return executePythonCode(
+            env,
+            code,
+            objectKey,
+            setStage
+          );
         }
       })
     },
     maxOutputTokens: 8192,
     stopWhen: () => false
   });
+
+  setStage('workers_ai_response_received');
 
   const finalText = result.text?.trim();
 
@@ -169,7 +193,21 @@ export default {
       });
     }
 
+    let stage = 'request_received';
+
+    const setStage: SetStage = (nextStage) => {
+      stage = nextStage;
+
+      // No registra token, prompt, objectKey, CSV ni código Python.
+      console.log({
+        event: 'cloudflare_ia_datos_stage',
+        stage
+      });
+    };
+
     try {
+      setStage('request_parse_body');
+
       const body = await request.json<{
         objectKey?: string;
         prompt?: string;
@@ -202,11 +240,16 @@ export default {
         );
       }
 
+      setStage('request_validated');
+
       const output = await handleAIRequest(
         prompt,
         objectKey,
-        env
+        env,
+        setStage
       );
+
+      setStage('response_ready');
 
       return Response.json({
         output
@@ -222,13 +265,13 @@ export default {
           ? error.message
           : 'Internal Server Error';
 
-      console.error(
-        JSON.stringify({
-          event: 'cloudflare_ia_datos_error',
-          error_name: errorName,
-          error_message: errorMessage
-        })
-      );
+      // Registro estructurado y seguro para Observabilidad.
+      console.error({
+        event: 'cloudflare_ia_datos_error',
+        stage,
+        error_name: errorName,
+        error_message: errorMessage
+      });
 
       return Response.json(
         {
