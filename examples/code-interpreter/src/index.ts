@@ -112,9 +112,6 @@ async function handleAIRequest(
       })
     },
     maxOutputTokens: 8192,
-
-    // No impone un máximo de llamadas a Python.
-    // El ciclo termina cuando el modelo entrega su respuesta final.
     stopWhen: () => false
   });
 
@@ -215,16 +212,27 @@ export default {
         output
       });
     } catch (error) {
-      console.error('Request failed:', error);
+      const errorName =
+        error instanceof Error
+          ? error.name
+          : 'UnknownError';
 
-      const message =
+      const errorMessage =
         error instanceof Error
           ? error.message
           : 'Internal Server Error';
 
+      console.error(
+        JSON.stringify({
+          event: 'cloudflare_ia_datos_error',
+          error_name: errorName,
+          error_message: errorMessage
+        })
+      );
+
       return Response.json(
         {
-          error: message
+          error: errorMessage
         },
         {
           status: 500
