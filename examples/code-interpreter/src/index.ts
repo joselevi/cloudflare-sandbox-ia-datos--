@@ -8,49 +8,22 @@ export { Sandbox } from '@cloudflare/sandbox';
 
 const API_PATH = '/run';
 const MODEL = '@cf/openai/gpt-oss-120b' as const;
+const R2_BINDING = 'IA_DATOS_BUCKET';
+const R2_MOUNT_PATH = '/mnt/r2';
 
 type SetStage = (stage: string) => void;
 
-async function executePythonCode(
-  env: Env,
-  code: string,
-  objectKey: string,
-  setStage: SetStage
-): Promise<string> {
-  setStage('sandbox_get');
-
-  const sandboxId = env.Sandbox.idFromName('default');
-  const sandbox = getSandbox(
-    env.Sandbox,
-    sandboxId.toString().slice(0, 63)
-  );
-
-  const csvPath = `/mnt/r2/${objectKey}`;
-
-  setStage('sandbox_mount_r2');
-
-  await sandbox.mountBucket(
-    'IA_DATOS_BUCKET',
-    '/mnt/r2',
-    {
-      readOnly: true
-    }
-  );
-
-  setStage('sandbox_create_python_context');
-
-  const pythonCtx = await sandbox.createCodeContext({
-    language: 'python'
-  });
-
-  setStage('sandbox_run_python');
-
-  const result = await sandbox.runCode(code, {
-    context: pythonCtx
-  });
-
-  setStage('sandbox_python_completed');
-
+function formatPythonResult(result: {
+  results?: Array<{
+    text?: string;
+    html?: string;
+  }>;
+  logs?: {
+    stdout?: string[];
+    stderr?: string[];
+  };
+  error?: unknown;
+}): string {
   if (result.results?.length) {
     const outputs = result.results
       .map((item) => item.text || item.html || JSON.stringify(item))
@@ -76,8 +49,8 @@ async function executePythonCode(
   }
 
   return result.error
-    ? `Error: ${result.error}`
-    : output || `Código ejecutado correctamente. CSV disponible en: ${csvPath}`;
+    ? `Error: ${String(result.error)}`
+    : output || 'Código ejecutado correctamente.';
 }
 
 async function handleAIRequest(
@@ -86,68 +59,113 @@ async function handleAIRequest(
   env: Env,
   setStage: SetStage
 ): Promise<string> {
-  setStage('workers_ai_initialize');
+  const sandboxId = env.Sandbox.idFromName('default');
 
-  const workersai = createWorkersAI({
-    binding: env.AI
-  });
+  const sandbox = getSandbox(
+    env.Sandbox,
+    sandboxId.toString().slice(0, 63)
+  );
 
-  const csvPath = `/mnt/r2/${objectKey}`;
+  const csvPath = `${R2_MOUNT_PATH}/${objectKey}`;
 
-  setStage('workers_ai_generate_text');
+  setStage('sandbox_mount_r2');
 
-  const result = await generateText({
-    model: workersai(MODEL),
-    messages: [
-      {
-        role: 'system',
-        content: [
-          'Sos un analista de datos.',
-          `El CSV privado ya está montado dentro del sandbox en: ${csvPath}`,
-          'Usá execute_python las veces estrictamente necesarias para cumplir el prompt.',
-          'No inventes datos: analizá exclusivamente el CSV indicado.',
-          'Después devolvé únicamente la respuesta en el formato exigido por el prompt recibido.'
-        ].join(' ')
-      },
-      {
-        role: 'user',
-        content: prompt
-      }
-    ],
-    tools: {
-      execute_python: tool({
-        description:
-          'Ejecuta código Python dentro del sandbox para analizar el CSV privado montado en /mnt/r2.',
-        inputSchema: z.object({
-          code: z.string().describe(
-            `Código Python a ejecutar. El CSV está disponible en ${csvPath}.`
-          )
-        }),
-        execute: async ({ code }) => {
-          return executePythonCode(
-            env,
-            code,
-            objectKey,
-            setStage
-          );
+  await sandbox.mountBucket(
+    R2_BINDING,
+    R2_MOUNT_PATH,
+    {
+      readOnly: true
+    }
+  );
+
+  try {
+    setStage('sandbox_create_python_context');
+
+    const pythonCtx = await sandbox.createCodeContext({
+      language: 'python'
+    });
+
+    setStage('workers_ai_initialize');
+
+    const workersai = createWorkersAI({
+      binding: env.AI
+    });
+
+    setStage('workers_ai_generate_text');
+
+    const result = await generateText({
+      model: workersai(MODEL),
+      messages: [
+        {
+          role: 'system',
+          content: [
+            'Sos un analista de datos.',
+            `El CSV privado está disponible en: ${csvPath}`,
+            'Usá execute_python las veces estrictamente necesarias para cumplir el prompt.',
+            'No inventes datos: analizá exclusivamente el CSV indicado.',
+            'El código Python debe leer el CSV desde la ruta indicada.',
+            'Después devolvé únicamente la respuesta en el formato exigido por el prompt recibido.'
+          ].join(' ')
+        },
+        {
+          role: 'user',
+          content: prompt
         }
-      })
-    },
-    maxOutputTokens: 8192,
-    stopWhen: () => false
-  });
+      ],
+      tools: {
+        execute_python: tool({
+          description:
+            'Ejecuta código Python dentro del sandbox para analizar el CSV privado.',
+          inputSchema: z.object({
+            code: z.string().describe(
+              `Código Python a ejecutar. El CSV está disponible en ${csvPath}.`
+            )
+          }),
+          execute: async ({ code }) => {
+            setStage('sandbox_run_python');
 
-  setStage('workers_ai_response_received');
+            const result = await sandbox.runCode(code, {
+              context: pythonCtx
+            });
 
-  const finalText = result.text?.trim();
+            setStage('sandbox_python_completed');
 
-  if (!finalText) {
-    throw new Error(
-      `Workers AI no generó respuesta final. finishReason=${result.finishReason} steps=${result.steps.length} toolCalls=${result.toolCalls.length} toolResults=${result.toolResults.length}`
-    );
+            return formatPythonResult(result);
+          }
+        })
+      },
+      maxOutputTokens: 8192,
+      stopWhen: () => false
+    });
+
+    setStage('workers_ai_response_received');
+
+    const finalText = result.text?.trim();
+
+    if (!finalText) {
+      throw new Error(
+        `Workers AI no generó respuesta final. finishReason=${result.finishReason} steps=${result.steps.length} toolCalls=${result.toolCalls.length} toolResults=${result.toolResults.length}`
+      );
+    }
+
+    return finalText;
+  } finally {
+    setStage('sandbox_unmount_r2');
+
+    try {
+      await sandbox.unmountBucket(R2_MOUNT_PATH);
+      setStage('sandbox_r2_unmounted');
+    } catch (error) {
+      console.error({
+        event: 'cloudflare_ia_datos_unmount_error',
+        error_name: error instanceof Error ? error.name : 'UnknownError',
+        error_message:
+          error instanceof Error
+            ? error.message
+            : 'No se pudo desmontar R2'
+      });
+    }
   }
-
-  return finalText;
 }
 
 export default {
@@ -163,8 +181,7 @@ export default {
       }
     ).CLOUDFLARE_IA_DATOS_WORKER_TOKEN;
 
-    const authorization =
-      request.headers.get('Authorization');
+    const authorization = request.headers.get('Authorization');
 
     const expectedAuthorization = workerToken
       ? `Bearer ${workerToken}`
@@ -198,7 +215,6 @@ export default {
     const setStage: SetStage = (nextStage) => {
       stage = nextStage;
 
-      // No registra token, prompt, objectKey, CSV ni código Python.
       console.log({
         event: 'cloudflare_ia_datos_stage',
         stage
@@ -265,7 +281,6 @@ export default {
           ? error.message
           : 'Internal Server Error';
 
-      // Registro estructurado y seguro para Observabilidad.
       console.error({
         event: 'cloudflare_ia_datos_error',
         stage,
