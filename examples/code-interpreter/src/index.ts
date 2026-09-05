@@ -1,12 +1,5 @@
-import {
-  ContainerProxy,
-  getSandbox
-} from '@cloudflare/sandbox';
-import {
-  generateText,
-  stepCountIs,
-  tool
-} from 'ai';
+import { ContainerProxy, getSandbox } from '@cloudflare/sandbox';
+import { generateText, tool } from 'ai';
 import { createWorkersAI } from 'workers-ai-provider';
 import { z } from 'zod';
 
@@ -15,26 +8,11 @@ export { Sandbox } from '@cloudflare/sandbox';
 
 const API_PATH = '/run';
 const MODEL = '@cf/openai/gpt-oss-120b' as const;
-const MOUNT_PATH = '/mnt/r2';
-
-type WorkerRequest = {
-  input?: string;
-  objectKey?: string;
-  prompt?: string;
-};
-
-const isValidObjectKey = (
-  objectKey: unknown
-): objectKey is string => {
-  return (
-    typeof objectKey === 'string' &&
-    /^analisis\/[0-9a-f-]{36}\.csv$/i.test(objectKey)
-  );
-};
 
 async function executePythonCode(
   env: Env,
-  code: string
+  code: string,
+  objectKey: string
 ): Promise<string> {
   const sandboxId = env.Sandbox.idFromName('default');
 
@@ -43,107 +21,77 @@ async function executePythonCode(
     sandboxId.toString().slice(0, 63)
   );
 
-  let bucketMounted = false;
+  const csvPath = `/mnt/r2/${objectKey}`;
 
-  try {
-    await sandbox.mountBucket(
-      'IA_DATOS_BUCKET',
-      MOUNT_PATH,
-      {
-        readOnly: true
-      }
-    );
-
-    bucketMounted = true;
-
-    const pythonCtx = await sandbox.createCodeContext({
-      language: 'python'
-    });
-
-    const result = await sandbox.runCode(code, {
-      context: pythonCtx
-    });
-
-    if (
-      result.error ||
-      result.logs?.stderr?.length
-    ) {
-      const pythonError = [
-        result.error
-          ? String(result.error)
-          : '',
-        result.logs?.stderr?.length
-          ? result.logs.stderr.join('\n')
-          : ''
-      ]
-        .filter(Boolean)
-        .join('\n');
-
-      throw new Error(
-        pythonError || 'Python execution failed'
-      );
+  await sandbox.mountBucket(
+    'IA_DATOS_BUCKET',
+    '/mnt/r2',
+    {
+      readOnly: true
     }
+  );
 
-    if (result.results?.length) {
-      const outputs = result.results
-        .map((item) => {
-          return item.text ||
-            item.html ||
-            JSON.stringify(item);
-        })
-        .filter(Boolean);
+  const pythonCtx = await sandbox.createCodeContext({
+    language: 'python'
+  });
 
-      if (outputs.length) {
-        return outputs.join('\n');
-      }
-    }
+  const result = await sandbox.runCode(code, {
+    context: pythonCtx
+  });
 
-    if (result.logs?.stdout?.length) {
-      return result.logs.stdout.join('\n');
-    }
+  if (result.results?.length) {
+    const outputs = result.results
+      .map((item) => item.text || item.html || JSON.stringify(item))
+      .filter(Boolean);
 
-    return 'Code executed successfully';
-  } finally {
-    if (bucketMounted) {
-      try {
-        await sandbox.unmountBucket(MOUNT_PATH);
-      } catch {
-        // El error de desmontaje no debe ocultar el resultado o error original.
-      }
+    if (outputs.length) {
+      return outputs.join('\n');
     }
   }
+
+  let output = '';
+
+  if (result.logs?.stdout?.length) {
+    output = result.logs.stdout.join('\n');
+  }
+
+  if (result.logs?.stderr?.length) {
+    if (output) {
+      output += '\n';
+    }
+
+    output += `Error: ${result.logs.stderr.join('\n')}`;
+  }
+
+  return result.error
+    ? `Error: ${result.error}`
+    : output || `Código ejecutado correctamente. CSV disponible en: ${csvPath}`;
 }
 
 async function handleAIRequest(
   prompt: string,
-  csvPath: string | undefined,
+  objectKey: string,
   env: Env
 ): Promise<string> {
   const workersai = createWorkersAI({
     binding: env.AI
   });
 
-  const runtimeContext = csvPath
-    ? [
-        `CSV disponible en ${csvPath}.`,
-        'Ejecutá execute_python exactamente una vez.',
-        'Leé el CSV completo usando pandas.',
-        'El CSV utiliza separador punto y coma (;).',
-        'Usá dtype=str para conservar los valores.',
-        'No hagas prints intermedios.',
-        'El código Python debe imprimir solo los resultados necesarios para elaborar la respuesta final.',
-        'Después devolvé únicamente la respuesta en el formato exigido por el prompt recibido.'
-      ].join('\n')
-    : [
-        'Procesá la instrucción recibida.',
-        'Usá execute_python si corresponde.',
-        'Después devolvé la respuesta final.'
-      ].join('\n');
+  const csvPath = `/mnt/r2/${objectKey}`;
 
   const result = await generateText({
     model: workersai(MODEL),
-    system: runtimeContext,
     messages: [
+      {
+        role: 'system',
+        content: [
+          'Sos un analista de datos.',
+          `El CSV privado ya está montado dentro del sandbox en: ${csvPath}`,
+          'Usá execute_python las veces estrictamente necesarias para cumplir el prompt.',
+          'No inventes datos: analizá exclusivamente el CSV indicado.',
+          'Después devolvé únicamente la respuesta en el formato exigido por el prompt recibido.'
+        ].join(' ')
+      },
       {
         role: 'user',
         content: prompt
@@ -151,66 +99,30 @@ async function handleAIRequest(
     ],
     tools: {
       execute_python: tool({
-        description: [
-          'Ejecuta Python dentro del Sandbox.',
-          'Debe leer el CSV completo.',
-          'Debe usar el separador ;.',
-          'Debe devolver los resultados necesarios para construir la respuesta final.'
-        ].join(' '),
+        description:
+          'Ejecuta código Python dentro del sandbox para analizar el CSV privado montado en /mnt/r2.',
         inputSchema: z.object({
           code: z.string().describe(
-            'Código Python completo para ejecutar el análisis'
+            `Código Python a ejecutar. El CSV está disponible en ${csvPath}.`
           )
         }),
         execute: async ({ code }) => {
-          return executePythonCode(env, code);
+          return executePythonCode(env, code, objectKey);
         }
       })
     },
-    prepareStep: ({ stepNumber }) => {
-      if (!csvPath) {
-        return undefined;
-      }
-
-      if (stepNumber === 0) {
-        return {
-          activeTools: ['execute_python'],
-          toolChoice: {
-            type: 'tool',
-            toolName: 'execute_python'
-          }
-        };
-      }
-
-      return {
-        activeTools: []
-      };
-    },
     maxOutputTokens: 8192,
-    stopWhen: stepCountIs(2)
+
+    // No impone un máximo de llamadas a Python.
+    // El ciclo termina cuando el modelo entrega su respuesta final.
+    stopWhen: () => false
   });
 
-  const finalText = result.text?.trim() || '';
+  const finalText = result.text?.trim();
 
   if (!finalText) {
-    const toolCalls = (result.steps || [])
-      .reduce((total, step) => {
-        return total + (step.toolCalls?.length || 0);
-      }, 0);
-
-    const toolResults = (result.steps || [])
-      .reduce((total, step) => {
-        return total + (step.toolResults?.length || 0);
-      }, 0);
-
     throw new Error(
-      [
-        'Workers AI no generó respuesta final.',
-        `finishReason=${result.finishReason || 'unknown'}`,
-        `steps=${result.steps?.length || 0}`,
-        `toolCalls=${toolCalls}`,
-        `toolResults=${toolResults}`
-      ].join(' ')
+      `Workers AI no generó respuesta final. finishReason=${result.finishReason} steps=${result.steps.length} toolCalls=${result.toolCalls.length} toolResults=${result.toolResults.length}`
     );
   }
 
@@ -261,12 +173,17 @@ export default {
     }
 
     try {
-      const body = await request.json<WorkerRequest>();
+      const body = await request.json<{
+        objectKey?: string;
+        prompt?: string;
+      }>();
 
-      if (!body || typeof body !== 'object') {
+      const { objectKey, prompt } = body;
+
+      if (!objectKey || !prompt) {
         return Response.json(
           {
-            error: 'Invalid request body'
+            error: 'Missing objectKey or prompt field'
           },
           {
             status: 400
@@ -274,15 +191,9 @@ export default {
         );
       }
 
-      const {
-        input,
-        objectKey,
-        prompt
-      } = body;
-
       if (
-        objectKey !== undefined &&
-        !isValidObjectKey(objectKey)
+        objectKey.startsWith('/') ||
+        objectKey.includes('..')
       ) {
         return Response.json(
           {
@@ -294,43 +205,9 @@ export default {
         );
       }
 
-      const usingObjectKey =
-        typeof objectKey === 'string';
-
-      if (usingObjectKey && !prompt) {
-        return Response.json(
-          {
-            error: 'Missing prompt field'
-          },
-          {
-            status: 400
-          }
-        );
-      }
-
-      const requestPrompt =
-        usingObjectKey
-          ? prompt
-          : input;
-
-      if (!requestPrompt) {
-        return Response.json(
-          {
-            error: 'Missing input or objectKey field'
-          },
-          {
-            status: 400
-          }
-        );
-      }
-
-      const csvPath = usingObjectKey
-        ? `${MOUNT_PATH}/${objectKey}`
-        : undefined;
-
       const output = await handleAIRequest(
-        requestPrompt,
-        csvPath,
+        prompt,
+        objectKey,
         env
       );
 
@@ -338,6 +215,8 @@ export default {
         output
       });
     } catch (error) {
+      console.error('Request failed:', error);
+
       const message =
         error instanceof Error
           ? error.message
