@@ -45,11 +45,7 @@ async function executePythonCode(
 
   let bucketMounted = false;
 
-  // console.log('[Worker] executePythonCode START');
-
   try {
-    // console.log('[Worker] mountBucket START');
-
     await sandbox.mountBucket(
       'IA_DATOS_BUCKET',
       MOUNT_PATH,
@@ -60,30 +56,13 @@ async function executePythonCode(
 
     bucketMounted = true;
 
-    // console.log('[Worker] mountBucket END');
-
-    // console.log('[Worker] createCodeContext START');
-
     const pythonCtx = await sandbox.createCodeContext({
       language: 'python'
     });
 
-    // console.log('[Worker] createCodeContext END');
-
-    // console.log('[Worker] runCode START');
-
     const result = await sandbox.runCode(code, {
       context: pythonCtx
     });
-
-    /*
-    console.log('[Worker] runCode END', {
-      hasError: Boolean(result.error),
-      results: result.results?.length || 0,
-      stdout: result.logs?.stdout?.length || 0,
-      stderr: result.logs?.stderr?.length || 0
-    });
-    */
 
     if (
       result.error ||
@@ -124,39 +103,14 @@ async function executePythonCode(
     }
 
     return 'Code executed successfully';
-  } catch (error) {
-    /*
-    console.error('[Worker] executePythonCode ERROR', {
-      message: error instanceof Error
-        ? error.message
-        : 'Unknown error'
-    });
-    */
-
-    throw error;
   } finally {
     if (bucketMounted) {
-      // console.log('[Worker] unmountBucket START');
-
       try {
         await sandbox.unmountBucket(MOUNT_PATH);
-
-        // console.log('[Worker] unmountBucket END');
-      } catch (error) {
-        /*
-        console.error(
-          '[Worker] unmountBucket ERROR',
-          {
-            message: error instanceof Error
-              ? error.message
-              : 'Unknown error'
-          }
-        );
-        */
+      } catch {
+        // El error de desmontaje no debe ocultar el resultado o error original.
       }
     }
-
-    // console.log('[Worker] executePythonCode END');
   }
 }
 
@@ -172,13 +126,13 @@ async function handleAIRequest(
   const runtimeContext = csvPath
     ? [
         `CSV disponible en ${csvPath}.`,
-        'Ejecutá execute_python una sola vez.',
+        'Ejecutá execute_python exactamente una vez.',
         'Leé el CSV completo usando pandas.',
         'El CSV utiliza separador punto y coma (;).',
         'Usá dtype=str para conservar los valores.',
         'No hagas prints intermedios.',
-        'El código Python debe imprimir únicamente el JSON final.',
-        'Después devolvé únicamente ese JSON válido.'
+        'El código Python debe imprimir solo los resultados necesarios para elaborar la respuesta final.',
+        'Después devolvé únicamente la respuesta en el formato exigido por el prompt recibido.'
       ].join('\n')
     : [
         'Procesá la instrucción recibida.',
@@ -186,65 +140,59 @@ async function handleAIRequest(
         'Después devolvé la respuesta final.'
       ].join('\n');
 
-  /*
-  console.log('[Worker] generateText START', {
-    hasCsvPath: Boolean(csvPath),
-    promptLength: prompt.length
-  });
-  */
-
-  try {
-    const result = await generateText({
-      model: workersai(MODEL),
-      system: runtimeContext,
-      messages: [
-        {
-          role: 'user',
-          content: prompt
+  const result = await generateText({
+    model: workersai(MODEL),
+    system: runtimeContext,
+    messages: [
+      {
+        role: 'user',
+        content: prompt
+      }
+    ],
+    tools: {
+      execute_python: tool({
+        description: [
+          'Ejecuta Python dentro del Sandbox.',
+          'Debe leer el CSV completo.',
+          'Debe usar el separador ;.',
+          'Debe devolver los resultados necesarios para construir la respuesta final.'
+        ].join(' '),
+        inputSchema: z.object({
+          code: z.string().describe(
+            'Código Python completo para ejecutar el análisis'
+          )
+        }),
+        execute: async ({ code }) => {
+          return executePythonCode(env, code);
         }
-      ],
-      tools: {
-        execute_python: tool({
-          description: [
-            'Ejecuta Python dentro del Sandbox.',
-            'Debe leer el CSV completo.',
-            'Debe usar el separador ;.',
-            'Debe devolver únicamente el JSON final.'
-          ].join(' '),
-          inputSchema: z.object({
-            code: z.string().describe(
-              'Código Python completo para ejecutar el análisis'
-            )
-          }),
-          execute: async ({ code }) => {
-            /*
-            console.log(
-              '[Worker] execute_python TOOL START'
-            );
-            */
+      })
+    },
+    prepareStep: ({ stepNumber }) => {
+      if (!csvPath) {
+        return undefined;
+      }
 
-            const output = await executePythonCode(
-              env,
-              code
-            );
-
-            /*
-            console.log(
-              '[Worker] execute_python TOOL END',
-              {
-                outputLength: output.length
-              }
-            );
-            */
-
-            return output;
+      if (stepNumber === 0) {
+        return {
+          activeTools: ['execute_python'],
+          toolChoice: {
+            type: 'tool',
+            toolName: 'execute_python'
           }
-        })
-      },
-      maxOutputTokens: 8192,
-      stopWhen: stepCountIs(2)
-    });
+        };
+      }
 
+      return {
+        activeTools: []
+      };
+    },
+    maxOutputTokens: 8192,
+    stopWhen: stepCountIs(2)
+  });
+
+  const finalText = result.text?.trim() || '';
+
+  if (!finalText) {
     const toolCalls = (result.steps || [])
       .reduce((total, step) => {
         return total + (step.toolCalls?.length || 0);
@@ -255,52 +203,18 @@ async function handleAIRequest(
         return total + (step.toolResults?.length || 0);
       }, 0);
 
-    const finalText = result.text?.trim() || '';
-
-    /*
-    console.log('[Worker] generateText END', {
-      finishReason: result.finishReason || 'unknown',
-      steps: result.steps?.length || 0,
-      toolCalls,
-      toolResults,
-      responseLength: finalText.length
-    });
-    */
-
-    if (!finalText) {
-      throw new Error(
-        [
-          'Workers AI no generó respuesta final.',
-          `finishReason=${result.finishReason || 'unknown'}`,
-          `steps=${result.steps?.length || 0}`,
-          `toolCalls=${toolCalls}`,
-          `toolResults=${toolResults}`
-        ].join(' ')
-      );
-    }
-
-    if (csvPath) {
-      try {
-        JSON.parse(finalText);
-      } catch {
-        throw new Error(
-          'Workers AI devolvió una respuesta que no es JSON válido.'
-        );
-      }
-    }
-
-    return finalText;
-  } catch (error) {
-    /*
-    console.error('[Worker] generateText ERROR', {
-      message: error instanceof Error
-        ? error.message
-        : 'Unknown error'
-    });
-    */
-
-    throw error;
+    throw new Error(
+      [
+        'Workers AI no generó respuesta final.',
+        `finishReason=${result.finishReason || 'unknown'}`,
+        `steps=${result.steps?.length || 0}`,
+        `toolCalls=${toolCalls}`,
+        `toolResults=${toolResults}`
+      ].join(' ')
+    );
   }
+
+  return finalText;
 }
 
 export default {
@@ -309,13 +223,6 @@ export default {
     env: Env
   ): Promise<Response> {
     const url = new URL(request.url);
-
-    /*
-    console.log('[Worker] REQUEST START', {
-      method: request.method,
-      pathname: url.pathname
-    });
-    */
 
     const workerToken = (
       env as Env & {
@@ -334,8 +241,6 @@ export default {
       !expectedAuthorization ||
       authorization !== expectedAuthorization
     ) {
-      // console.error('[Worker] AUTH ERROR');
-
       return Response.json(
         {
           error: 'Unauthorized'
@@ -350,13 +255,6 @@ export default {
       url.pathname !== API_PATH ||
       request.method !== 'POST'
     ) {
-      /*
-      console.error('[Worker] ROUTE ERROR', {
-        method: request.method,
-        pathname: url.pathname
-      });
-      */
-
       return new Response('Not Found', {
         status: 404
       });
@@ -381,14 +279,6 @@ export default {
         objectKey,
         prompt
       } = body;
-
-      /*
-      console.log('[Worker] BODY RECEIVED', {
-        hasInput: Boolean(input),
-        hasObjectKey: Boolean(objectKey),
-        hasPrompt: Boolean(prompt)
-      });
-      */
 
       if (
         objectKey !== undefined &&
@@ -438,37 +328,16 @@ export default {
         ? `${MOUNT_PATH}/${objectKey}`
         : undefined;
 
-      /*
-      console.log('[Worker] REQUEST VALIDATED', {
-        hasCsvPath: Boolean(csvPath),
-        promptLength: requestPrompt.length
-      });
-      */
-
       const output = await handleAIRequest(
         requestPrompt,
         csvPath,
         env
       );
 
-      /*
-      console.log('[Worker] REQUEST END', {
-        outputLength: output.length
-      });
-      */
-
       return Response.json({
         output
       });
     } catch (error) {
-      /*
-      console.error('[Worker] REQUEST ERROR', {
-        message: error instanceof Error
-          ? error.message
-          : 'Internal Server Error'
-      });
-      */
-
       const message =
         error instanceof Error
           ? error.message
