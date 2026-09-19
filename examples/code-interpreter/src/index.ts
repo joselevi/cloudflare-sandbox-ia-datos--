@@ -1,5 +1,5 @@
 import { ContainerProxy, getSandbox } from '@cloudflare/sandbox';
-import { generateText, tool } from 'ai';
+import { generateText, stepCountIs, tool } from 'ai';
 import { createWorkersAI } from 'workers-ai-provider';
 import { z } from 'zod';
 
@@ -8,8 +8,7 @@ export { Sandbox } from '@cloudflare/sandbox';
 
 const API_PATH = '/run';
 const MODEL = '@cf/openai/gpt-oss-120b' as const;
-const R2_BINDING = 'IA_DATOS_BUCKET';
-const R2_MOUNT_PATH = '/mnt/r2';
+const SANDBOX_WORKSPACE = '/workspace';
 
 type SetStage = (stage: string) => void;
 
@@ -66,17 +65,24 @@ async function handleAIRequest(
     sandboxId.toString().slice(0, 63)
   );
 
-  const csvPath = `${R2_MOUNT_PATH}/${objectKey}`;
+  // El Worker lee el CSV por binding de R2 y lo escribe en el sandbox con
+  // una ruta única por request: sin mounts compartidos ni desmontajes que
+  // puedan pisar lecturas de requests solapadas.
+  const csvPath = `${SANDBOX_WORKSPACE}/${objectKey.replaceAll('/', '_')}`;
 
-  setStage('sandbox_mount_r2');
+  setStage('worker_read_r2');
 
-  await sandbox.mountBucket(
-    R2_BINDING,
-    R2_MOUNT_PATH,
-    {
-      readOnly: true
-    }
-  );
+  const r2Object = await env.IA_DATOS_BUCKET.get(objectKey);
+
+  if (!r2Object) {
+    throw new Error(`Objeto R2 no encontrado: ${objectKey}`);
+  }
+
+  const csvText = await r2Object.text();
+
+  setStage('sandbox_write_file');
+
+  await sandbox.writeFile(csvPath, csvText);
 
   try {
     setStage('sandbox_create_python_context');
@@ -101,6 +107,7 @@ async function handleAIRequest(
           content: [
             'Sos un analista de datos.',
             `El CSV privado está disponible en: ${csvPath}`,
+            'El CSV usa separador ";" y encoding UTF-8.',
             'Usá execute_python las veces estrictamente necesarias para cumplir el prompt.',
             'No inventes datos: analizá exclusivamente el CSV indicado.',
             'El código Python debe leer el CSV desde la ruta indicada.',
@@ -135,7 +142,7 @@ async function handleAIRequest(
         })
       },
       maxOutputTokens: 8192,
-      stopWhen: () => false
+      stopWhen: stepCountIs(10)
     });
 
     setStage('workers_ai_response_received');
@@ -150,19 +157,22 @@ async function handleAIRequest(
 
     return finalText;
   } finally {
-    setStage('sandbox_unmount_r2');
+    // Limpieza best-effort: el sandbox es compartido entre requests y los
+    // CSV acumulados ocupan espacio en su filesystem.
+    setStage('sandbox_cleanup_file');
 
     try {
-      await sandbox.unmountBucket(R2_MOUNT_PATH);
-      setStage('sandbox_r2_unmounted');
+      await sandbox.deleteFile(csvPath);
+      setStage('sandbox_cleanup_done');
     } catch (error) {
       console.error({
-        event: 'cloudflare_ia_datos_unmount_error',
+        event: 'cloudflare_ia_datos_cleanup_error',
+        path: csvPath,
         error_name: error instanceof Error ? error.name : 'UnknownError',
         error_message:
           error instanceof Error
             ? error.message
-            : 'No se pudo desmontar R2'
+            : 'No se pudo eliminar el CSV del sandbox'
       });
     }
   }
