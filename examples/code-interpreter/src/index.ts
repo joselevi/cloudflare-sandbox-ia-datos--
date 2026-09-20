@@ -9,6 +9,7 @@ export { Sandbox } from '@cloudflare/sandbox';
 const API_PATH = '/run';
 const MODEL = '@cf/openai/gpt-oss-120b' as const;
 const SANDBOX_WORKSPACE = '/workspace';
+const HEARTBEAT_INTERVAL_MS = 15000;
 
 type SetStage = (stage: string) => void;
 
@@ -178,6 +179,66 @@ async function handleAIRequest(
   }
 }
 
+// El análisis puede tardar minutos: la respuesta se transmite con heartbeats
+// para que el edge nunca vea la conexión sin bytes y la corte por inactividad.
+// Los espacios previos son inocuos: JSON.parse los tolera y el texto se trimea.
+function streamingResponse(
+  work: (setStage: SetStage) => Promise<string>,
+  setStage: SetStage
+): Response {
+  const encoder = new TextEncoder();
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        controller.enqueue(encoder.encode(' '));
+
+        heartbeat = setInterval(() => {
+          controller.enqueue(encoder.encode(' '));
+        }, HEARTBEAT_INTERVAL_MS);
+
+        const output = await work(setStage);
+
+        setStage('response_ready');
+
+        controller.enqueue(encoder.encode(output));
+      } catch (error) {
+        const errorMessage =
+          error instanceof Error
+            ? error.message
+            : 'Internal Server Error';
+
+        console.error({
+          event: 'cloudflare_ia_datos_error',
+          stage: 'streaming_work',
+          error_name: error instanceof Error ? error.name : 'UnknownError',
+          error_message: errorMessage
+        });
+
+        controller.enqueue(encoder.encode(JSON.stringify({ error: errorMessage })));
+      } finally {
+        if (heartbeat) {
+          clearInterval(heartbeat);
+        }
+
+        controller.close();
+      }
+    },
+    cancel() {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
+    }
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'application/json'
+    }
+  });
+}
+
 export default {
   async fetch(
     request: Request,
@@ -268,18 +329,10 @@ export default {
 
       setStage('request_validated');
 
-      const output = await handleAIRequest(
-        prompt,
-        objectKey,
-        env,
+      return streamingResponse(
+        () => handleAIRequest(prompt, objectKey, env, setStage),
         setStage
       );
-
-      setStage('response_ready');
-
-      return Response.json({
-        output
-      });
     } catch (error) {
       const errorName =
         error instanceof Error
