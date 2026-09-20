@@ -181,7 +181,8 @@ async function handleAIRequest(
 
 // El análisis puede tardar minutos: la respuesta se transmite con heartbeats
 // para que el edge nunca vea la conexión sin bytes y la corte por inactividad.
-// Los espacios previos son inocuos: JSON.parse los tolera y el texto se trimea.
+// Los espacios iniciales son inocuos: JSON.parse los tolera y el texto se trimea.
+// El envelope {"output": ...} es el contrato que espera el extractor del lado Node.
 function streamingResponse(
   work: (setStage: SetStage) => Promise<string>,
   setStage: SetStage
@@ -202,7 +203,7 @@ function streamingResponse(
 
         setStage('response_ready');
 
-        controller.enqueue(encoder.encode(output));
+        controller.enqueue(encoder.encode(JSON.stringify({ output })));
       } catch (error) {
         const errorMessage =
           error instanceof Error
