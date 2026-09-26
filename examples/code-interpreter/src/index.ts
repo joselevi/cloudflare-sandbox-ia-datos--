@@ -13,6 +13,50 @@ const HEARTBEAT_INTERVAL_MS = 15000;
 
 type SetStage = (stage: string) => void;
 
+// El JSON del contrato se identifica por rows_processed: los outputs del
+// script de análisis siempre lo traen; cualquier otra salida del modelo no.
+function esJsonDeContrato(valor: unknown): valor is Record<string, unknown> {
+  return (
+    typeof valor === 'object' &&
+    valor !== null &&
+    'rows_processed' in valor
+  );
+}
+
+// Tolerante a ruido alrededor del JSON (ej: stderr agregado por
+// formatPythonResult): prueba el texto completo y luego el recorte entre
+// el primer '{' y el último '}'.
+function extraerJsonContrato(texto: string): string | null {
+  const intentos: string[] = [texto.trim()];
+  const inicio = texto.indexOf('{');
+  const fin = texto.lastIndexOf('}');
+
+  if (inicio !== -1 && fin > inicio) {
+    intentos.push(texto.slice(inicio, fin + 1));
+  }
+
+  for (const intento of intentos) {
+    try {
+      const valor: unknown = JSON.parse(intento);
+
+      if (esJsonDeContrato(valor)) {
+        return intento;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+// AI SDK >=5 usa `output` para el valor generado por execute; versiones
+// previas usaban `result`. Se aceptan ambas formas en runtime.
+type ToolResultCandidate = {
+  output?: unknown;
+  result?: unknown;
+};
+
 function formatPythonResult(result: {
   results?: Array<{
     text?: string;
@@ -147,6 +191,35 @@ async function handleAIRequest(
     });
 
     setStage('workers_ai_response_received');
+
+    // El stdout del script (tool result) es el JSON tal como lo generó
+    // Python: exacto y sin el tope de tokens de generación que el texto
+    // final del modelo sí padece. Se prefiere ese camino y el texto del
+    // modelo queda como respaldo.
+    const salidasScript: string[] = [];
+
+    for (const step of result.steps) {
+      const resultadosStep = (step as { toolResults?: readonly unknown[] }).toolResults ?? [];
+
+      for (const item of resultadosStep) {
+        const candidato = item as ToolResultCandidate;
+        const salida = candidato.output ?? candidato.result;
+
+        if (typeof salida === 'string') {
+          salidasScript.push(salida);
+        }
+      }
+    }
+
+    for (let i = salidasScript.length - 1; i >= 0; i -= 1) {
+      const jsonScript = extraerJsonContrato(salidasScript[i]);
+
+      if (jsonScript) {
+        setStage('worker_tool_result_preferido');
+
+        return jsonScript;
+      }
+    }
 
     const finalText = result.text?.trim();
 
