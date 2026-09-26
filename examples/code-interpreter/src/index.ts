@@ -142,7 +142,7 @@ async function handleAIRequest(
           }
         })
       },
-      maxOutputTokens: 8192,
+      maxOutputTokens: 65536,
       stopWhen: stepCountIs(10)
     });
 
